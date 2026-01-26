@@ -1,0 +1,40 @@
+# Cloud Scheduler Configuration
+# This file documents the scheduler settings for the redirect automation
+
+scheduler:
+  name: slack-redirect-automation-scheduler
+  description: "Triggers the Slack redirect automation to process pending redirect requests"
+  
+  # Schedule: Every 4 hours
+  # Cron format: minute hour day-of-month month day-of-week
+  schedule: "0 */4 * * *"
+  
+  # Timezone for the schedule
+  timezone: "Europe/Madrid"
+  
+  # HTTP target configuration
+  http_target:
+    method: POST
+    headers:
+      Content-Type: "application/json"
+  
+  # Retry configuration
+  retry_config:
+    retry_count: 3
+    min_backoff: "5s"
+    max_backoff: "1h"
+    max_doublings: 5
+
+# Alternative schedules (uncomment to use):
+# 
+# Every 2 hours:
+# schedule: "0 */2 * * *"
+#
+# Every hour during business hours (9 AM - 6 PM):
+# schedule: "0 9-18 * * 1-5"
+#
+# Three times a day (9 AM, 1 PM, 5 PM):
+# schedule: "0 9,13,17 * * *"
+#
+# Every 30 minutes:
+# schedule: "*/30 * * * *"
