@@ -1,0 +1,369 @@
+{
+  "name": "Slack Redirect Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 4
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Run Every 4 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "resource": "channel",
+        "operation": "history",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $env.SLACK_CHANNEL_ID }}",
+          "mode": "id"
+        },
+        "limit": 50,
+        "filters": {}
+      },
+      "id": "slack-get-messages",
+      "name": "Get Slack Messages",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [220, 0],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_CREDENTIALS_ID",
+          "name": "Slack Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-urls",
+              "leftValue": "={{ $json.text }}",
+              "rightValue": "https://",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "filter-has-urls",
+      "name": "Has URLs?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "not-processed",
+              "leftValue": "={{ JSON.stringify($json.reactions || []) }}",
+              "rightValue": "white_check_mark",
+              "operator": {
+                "type": "string",
+                "operation": "notContains"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "filter-not-processed",
+      "name": "Not Processed Yet?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse redirect requests from Slack messages\n// Supports multiple formats: Old/New, from/to, multiple old URLs, Spanish labels\n\nconst messages = $input.all();\nconst results = [];\n\nfor (const item of messages) {\n  const text = item.json.text || '';\n  const messageTs = item.json.ts || '';\n  const user = item.json.user || '';\n  const channel = item.json.channel || $env.SLACK_CHANNEL_ID;\n  \n  // Clean Slack formatting: <url|display> -> url, <url> -> url\n  let cleanText = text\n    .replace(/<(https?:\\/\\/[^|>]+)\\|[^>]+>/g, '$1')\n    .replace(/<(https?:\\/\\/[^>]+)>/g, '$1');\n  \n  // URL regex pattern\n  const urlPattern = /https?:\\/\\/[^\\s<>\"'\\]\\)]+[^\\s<>\"'\\]\\)\\.,;:!?]/g;\n  \n  // Extract all URLs\n  const allUrls = cleanText.match(urlPattern) || [];\n  \n  if (allUrls.length < 2) {\n    continue; // Need at least 2 URLs for a redirect\n  }\n  \n  // Extract reason if present\n  const reasonMatch = cleanText.match(/(?:reason|razón|motivo)\\s*[:\\-]?\\s*(.+?)(?:\\n|$)/i);\n  const reason = reasonMatch ? reasonMatch[1].trim() : '';\n  \n  // Patterns for old/new detection\n  const oldPatterns = /(?:old|vieja|antigua|from|de|origen)s?\\s*(?:ones?|urls?)?\\s*[:\\-]?/i;\n  const newPatterns = /(?:new|nueva|to|a|destino|hacia)\\s*(?:ones?|urls?)?\\s*[:\\-]?/i;\n  \n  const hasOldLabel = oldPatterns.test(cleanText);\n  const hasNewLabel = newPatterns.test(cleanText);\n  \n  let redirects = [];\n  \n  if (hasOldLabel && hasNewLabel) {\n    // Parse labeled format\n    const lines = cleanText.split('\\n');\n    let oldUrls = [];\n    let newUrls = [];\n    let currentType = null;\n    \n    for (const line of lines) {\n      const trimmedLine = line.trim();\n      if (!trimmedLine) continue;\n      \n      if (oldPatterns.test(trimmedLine)) {\n        currentType = 'old';\n      } else if (newPatterns.test(trimmedLine)) {\n        currentType = 'new';\n      }\n      \n      const lineUrls = trimmedLine.match(urlPattern) || [];\n      \n      if (currentType === 'old') {\n        oldUrls.push(...lineUrls);\n      } else if (currentType === 'new') {\n        newUrls.push(...lineUrls);\n      }\n    }\n    \n    // Create redirect pairs\n    if (oldUrls.length > 0 && newUrls.length > 0) {\n      if (newUrls.length === 1) {\n        // Multiple old URLs to one new URL\n        for (const oldUrl of oldUrls) {\n          redirects.push({ oldUrl, newUrl: newUrls[0] });\n        }\n      } else if (oldUrls.length === newUrls.length) {\n        // 1:1 mapping\n        for (let i = 0; i < oldUrls.length; i++) {\n          redirects.push({ oldUrl: oldUrls[i], newUrl: newUrls[i] });\n        }\n      } else {\n        // Sequential pairing\n        for (let i = 0; i < oldUrls.length && i < newUrls.length; i++) {\n          redirects.push({ oldUrl: oldUrls[i], newUrl: newUrls[i] });\n        }\n      }\n    }\n  } else if (allUrls.length === 2) {\n    // Simple two URLs - assume first is old, second is new\n    // Check if same domain\n    try {\n      const domain1 = new URL(allUrls[0]).hostname;\n      const domain2 = new URL(allUrls[1]).hostname;\n      if (domain1 === domain2) {\n        redirects.push({ oldUrl: allUrls[0], newUrl: allUrls[1] });\n      }\n    } catch (e) {\n      // Invalid URLs, skip\n    }\n  }\n  \n  // Add results\n  for (const redirect of redirects) {\n    results.push({\n      json: {\n        old_url: redirect.oldUrl,\n        new_url: redirect.newUrl,\n        message_ts: messageTs,\n        channel_id: channel,\n        requester: user,\n        reason: reason,\n        original_text: text\n      }\n    });\n  }\n}\n\nreturn results.length > 0 ? results : [{ json: { no_redirects: true } }];"
+      },
+      "id": "parse-urls",
+      "name": "Parse Redirect URLs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-redirects",
+              "leftValue": "={{ $json.no_redirects }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "filter-has-redirects",
+      "name": "Has Redirects?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [1100, 0]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $env.GOOGLE_SHEETS_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Redirects",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Old URL": "={{ $json.old_url }}",
+            "New URL": "={{ $json.new_url }}",
+            "Requester": "={{ $json.requester }}",
+            "Reason": "={{ $json.reason }}",
+            "Message TS": "={{ $json.message_ts }}",
+            "Status": "pending",
+            "Processed At": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            { "id": "Old URL", "displayName": "Old URL", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "New URL", "displayName": "New URL", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Requester", "displayName": "Requester", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Reason", "displayName": "Reason", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Message TS", "displayName": "Message TS", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Status", "displayName": "Status", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Processed At", "displayName": "Processed At", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true }
+          ]
+        },
+        "options": {}
+      },
+      "id": "save-to-sheets",
+      "name": "Save to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1320, 0],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIALS_ID",
+          "name": "Google Sheets Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_REDIRECT_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"old_url\": \"{{ $json.old_url }}\",\n  \"new_url\": \"{{ $json.new_url }}\",\n  \"requester\": \"{{ $json.requester }}\",\n  \"reason\": \"{{ $json.reason }}\"\n}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "call-redirect-webhook",
+      "name": "Execute Redirect Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1540, 0]
+    },
+    {
+      "parameters": {
+        "resource": "reaction",
+        "operation": "add",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $json.channel_id }}",
+          "mode": "id"
+        },
+        "timestamp": "={{ $json.message_ts }}",
+        "name": "white_check_mark"
+      },
+      "id": "mark-processed",
+      "name": "Mark as Processed",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1760, 0],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_CREDENTIALS_ID",
+          "name": "Slack Account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "id": "no-op-end",
+      "name": "Done",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1980, 0]
+    },
+    {
+      "parameters": {
+        "content": "## Slack Redirect Automation\n\n### Configuración Requerida:\n\n1. **Variables de Entorno** (Settings > Variables):\n   - `SLACK_CHANNEL_ID`: ID del canal #smn_redirect_requests\n   - `GOOGLE_SHEETS_ID`: ID de tu Google Sheet\n   - `N8N_REDIRECT_WEBHOOK_URL`: URL del webhook que procesa las redirecciones\n\n2. **Credenciales**:\n   - Slack: Necesitas una app con permisos `channels:history`, `channels:read`, `reactions:write`\n   - Google Sheets: OAuth2 con acceso a tu spreadsheet\n\n3. **Google Sheet**: Crea una hoja llamada \"Redirects\" con estas columnas:\n   - Old URL | New URL | Requester | Reason | Message TS | Status | Processed At\n\n### Formatos de mensaje soportados:\n- `Old: url` / `New: url`\n- `from: url` / `to: url`  \n- `Old ones: url1, url2...` / `New: url`\n- URLs en español: `Vieja/Nueva`",
+        "height": 460,
+        "width": 400
+      },
+      "id": "sticky-note",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-300, -200]
+    }
+  ],
+  "connections": {
+    "Run Every 4 Hours": {
+      "main": [
+        [
+          {
+            "node": "Get Slack Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Slack Messages": {
+      "main": [
+        [
+          {
+            "node": "Has URLs?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has URLs?": {
+      "main": [
+        [
+          {
+            "node": "Not Processed Yet?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Not Processed Yet?": {
+      "main": [
+        [
+          {
+            "node": "Parse Redirect URLs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Redirect URLs": {
+      "main": [
+        [
+          {
+            "node": "Has Redirects?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Redirects?": {
+      "main": [
+        [
+          {
+            "node": "Save to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Execute Redirect Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Redirect Webhook": {
+      "main": [
+        [
+          {
+            "node": "Mark as Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark as Processed": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "automation"
+    },
+    {
+      "name": "slack"
+    }
+  ],
+  "triggerCount": 1,
+  "pinData": {}
+}
